@@ -131,7 +131,7 @@ fn main() -> anyhow::Result<()> {
                 "[agentplug] shared daemon did not publish a fresh heartbeat after two start attempts; serving {} with its single-process watcher until the shared daemon recovers",
                 cwd.display()
             );
-            run_spool_watcher_single_process(&mut project, &spool_dir)
+            daemon::run_standalone_watcher(project, &spool_dir, engine, module, content_hash)
         }
         "daemon-guard" => daemon::run_daemon_guard(),
         "daemon" => daemon::run_daemon(),
@@ -1460,6 +1460,8 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
                 ),
                 InFlightHandle {
                     detach: Arc::new(AtomicBool::new(false)),
+                    lane: agentplug_host::DispatchLane::State,
+                    session: String::new(),
                 },
             )
     };
@@ -2009,6 +2011,8 @@ fn selfcheck_inflight_cleanup() -> anyhow::Result<()> {
             key.clone(),
             daemon::InFlightHandle {
                 detach: Arc::new(AtomicBool::new(false)),
+                lane: agentplug_host::DispatchLane::State,
+                session: String::new(),
             },
         );
 
@@ -2073,6 +2077,8 @@ fn selfcheck_idle_evict() -> anyhow::Result<()> {
             key.clone(),
             daemon::InFlightHandle {
                 detach: Arc::new(AtomicBool::new(false)),
+                lane: agentplug_host::DispatchLane::State,
+                session: String::new(),
             },
         );
     let claimed = daemon::idle_projects_to_evict(&projects, evict_before);
@@ -2271,159 +2277,3 @@ fn selfcheck_browser_lease() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_standalone_status(status_path: &std::path::Path, busy_until: Option<u64>) {
-    use std::fs;
-    let mut payload = match fs::read_to_string(status_path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-    {
-        Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
-        _ => serde_json::json!({}),
-    };
-    payload["pid"] = serde_json::json!(std::process::id());
-    payload["ts"] = serde_json::json!(agentplug_host::now_ms());
-    payload["runtime"] = serde_json::json!("agentplug-runner-standalone");
-    payload["daemon"] = serde_json::json!(false);
-    payload["shared_process"] = serde_json::json!(false);
-    if let Some(busy_until) = busy_until {
-        payload["busy_until"] = serde_json::json!(busy_until);
-    } else {
-        payload.as_object_mut().map(|m| m.remove("busy_until"));
-    }
-    let _ = fs::write(status_path, payload.to_string());
-}
-
-const STANDALONE_BUSY_HEARTBEAT_MS: u64 = 5_000;
-const STANDALONE_BUSY_EXTEND_MS: u64 = 20_000;
-
-fn spawn_standalone_busy_ticker(
-    status_path: std::path::PathBuf,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-            write_standalone_status(
-                &status_path,
-                Some(agentplug_host::now_ms() + STANDALONE_BUSY_EXTEND_MS),
-            );
-            std::thread::sleep(std::time::Duration::from_millis(
-                STANDALONE_BUSY_HEARTBEAT_MS,
-            ));
-        }
-    })
-}
-
-fn clear_standalone_status(status_path: &std::path::Path) {
-    use std::fs;
-    let Some(serde_json::Value::Object(mut map)) = fs::read_to_string(status_path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-    else {
-        return;
-    };
-    map.remove("runtime");
-    map.remove("daemon");
-    map.remove("shared_process");
-    map.insert(
-        "ts".to_string(),
-        serde_json::json!(agentplug_host::now_ms()),
-    );
-    let _ = fs::write(status_path, serde_json::Value::Object(map).to_string());
-}
-
-fn run_spool_watcher_single_process(
-    project: &mut ProjectPlugins,
-    spool_dir: &std::path::Path,
-) -> anyhow::Result<()> {
-    use std::fs;
-    use std::time::Duration;
-
-    let in_dir = spool_dir.join("in");
-    let out_dir = spool_dir.join("out");
-    fs::create_dir_all(&in_dir)?;
-    fs::create_dir_all(&out_dir)?;
-    let status_path = spool_dir.join(".status.json");
-
-    if !daemon::claim_standalone_watcher_slot(spool_dir) {
-        eprintln!(
-            "[agentplug] another standalone watcher is already live for {} -- exiting rather than sweeping the claims it is serving",
-            spool_dir.display()
-        );
-        return Ok(());
-    }
-
-    loop {
-        if daemon::shared_daemon_is_serving() {
-            clear_standalone_status(&status_path);
-            daemon::release_standalone_watcher_slot(spool_dir);
-            eprintln!(
-                "[agentplug] shared daemon is serving again -- standalone watcher for {} exiting between dispatches, leaving every unclaimed request in the spool for it",
-                spool_dir.display()
-            );
-            return Ok(());
-        }
-
-        write_standalone_status(&status_path, None);
-
-        let mut work_done = false;
-        if let Ok(verb_dirs) = fs::read_dir(&in_dir) {
-            for verb_entry in verb_dirs.flatten() {
-                if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    continue;
-                }
-                let verb = verb_entry.file_name().to_string_lossy().into_owned();
-                let verb_dir = verb_entry.path();
-                let Ok(files) = fs::read_dir(&verb_dir) else {
-                    continue;
-                };
-                for file_entry in files.flatten() {
-                    let path = file_entry.path();
-                    if path.extension().and_then(|e| e.to_str()) != Some("txt") {
-                        continue;
-                    }
-                    let Some(claim_path) = daemon::claim_spool_request_in_place(&path) else {
-                        continue;
-                    };
-                    let Ok(body) = fs::read_to_string(&claim_path) else {
-                        let _ = fs::rename(&claim_path, &path);
-                        continue;
-                    };
-                    if body.trim().is_empty() {
-                        let _ = fs::rename(&claim_path, &path);
-                        continue;
-                    }
-                    let stem = path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let _dispatch_origin_scope =
-                        agentplug_host::enter_dispatch_origin_scope(&stem, None);
-
-                    let busy_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let ticker =
-                        spawn_standalone_busy_ticker(status_path.clone(), busy_stop.clone());
-                    let result = project.dispatch("gm", &verb, &body).unwrap_or_else(|e| {
-                        serde_json::json!({"ok": false, "verb": verb, "error": e.to_string()})
-                            .to_string()
-                    });
-                    busy_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let _ = ticker.join();
-
-                    let out_confirmed =
-                        daemon::write_spool_out_confirmed(&out_dir, &verb, &stem, &result);
-                    if out_confirmed {
-                        let _ = fs::remove_file(&claim_path);
-                    } else {
-                        eprintln!(
-                            "[agentplug] standalone: out-file write for {verb}/{stem} did not confirm -- leaving the claim in place for the orphan sweep to retry rather than deleting an unanswered request"
-                        );
-                    }
-                    work_done = true;
-                }
-            }
-        }
-        if !work_done {
-            std::thread::sleep(Duration::from_millis(150));
-        }
-    }
-}

@@ -7,6 +7,8 @@ pub(crate) type InFlightKey = (PathBuf, String, String);
 
 pub(crate) struct InFlightHandle {
     pub(crate) detach: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) lane: agentplug_host::DispatchLane,
+    pub(crate) session: String,
 }
 
 pub(super) static IN_FLIGHT: OnceLock<Mutex<HashMap<InFlightKey, InFlightHandle>>> = OnceLock::new();
@@ -16,6 +18,117 @@ pub(crate) fn in_flight_map() -> &'static Mutex<HashMap<InFlightKey, InFlightHan
 }
 
 pub(super) const MAX_CLAIMED_DISPATCHES_PER_PROJECT: usize = 32;
+
+pub(super) fn project_in_flight_by_lane(root: &Path) -> [usize; 3] {
+    let mut counts = [0usize; 3];
+    for ((active_root, _, _), handle) in in_flight_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        if active_root == root {
+            counts[handle.lane.index()] += 1;
+        }
+    }
+    counts
+}
+
+pub(super) fn lane_claim_budgets(root: &Path) -> [usize; 3] {
+    let in_flight = project_in_flight_by_lane(root);
+    [
+        MAX_CLAIMED_DISPATCHES_PER_PROJECT.saturating_sub(in_flight[0]),
+        MAX_CLAIMED_DISPATCHES_PER_PROJECT.saturating_sub(in_flight[1]),
+        MAX_CLAIMED_DISPATCHES_PER_PROJECT.saturating_sub(in_flight[2]),
+    ]
+}
+
+const SESSION_CLAIM_SHARE_DIVISOR: usize = 2;
+
+pub(super) const fn session_claim_cap_per_lane() -> usize {
+    let share = MAX_CLAIMED_DISPATCHES_PER_PROJECT / SESSION_CLAIM_SHARE_DIVISOR;
+    if share == 0 {
+        1
+    } else {
+        share
+    }
+}
+
+pub(super) fn session_lane_in_flight(root: &Path) -> HashMap<(usize, String), usize> {
+    let mut counts: HashMap<(usize, String), usize> = HashMap::new();
+    for ((active_root, _, _), handle) in in_flight_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        if active_root == root {
+            *counts
+                .entry((handle.lane.index(), handle.session.clone()))
+                .or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+pub(super) fn session_key_from_task(task: &str) -> String {
+    agentplug_host::session_key_from_task(task)
+}
+
+pub(super) struct ClaimCandidate {
+    pub(super) queued_since: std::time::SystemTime,
+    pub(super) verb: String,
+    pub(super) path: PathBuf,
+    pub(super) lane: agentplug_host::DispatchLane,
+    pub(super) session: String,
+}
+
+pub(super) fn order_claims_round_robin_by_session(mut candidates: Vec<ClaimCandidate>) -> Vec<ClaimCandidate> {
+    candidates.sort_by_key(|candidate| candidate.queued_since);
+    let mut groups: Vec<(String, std::collections::VecDeque<ClaimCandidate>)> = Vec::new();
+    for candidate in candidates {
+        match groups.iter_mut().find(|(session, _)| *session == candidate.session) {
+            Some((_, group)) => group.push_back(candidate),
+            None => {
+                let session = candidate.session.clone();
+                let mut group = std::collections::VecDeque::new();
+                group.push_back(candidate);
+                groups.push((session, group));
+            }
+        }
+    }
+    let mut ordered = Vec::new();
+    loop {
+        let mut took_any = false;
+        for (_, group) in groups.iter_mut() {
+            if let Some(candidate) = group.pop_front() {
+                ordered.push(candidate);
+                took_any = true;
+            }
+        }
+        if !took_any {
+            return ordered;
+        }
+    }
+}
+
+pub(super) fn claim_pass_marks() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static MARKS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    MARKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(super) fn note_claim_pass(root: &Path) {
+    claim_pass_marks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(root.to_path_buf(), now_ms());
+}
+
+pub(super) fn claim_pass_ts(root: &Path) -> Option<u64> {
+    claim_pass_marks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(root)
+        .copied()
+}
 
 /// The lane-wait budget for every lane except codesearch and git, and the floor every other
 /// budget is read against.
@@ -2535,6 +2648,7 @@ pub(crate) fn run_gm_dispatch_to_file(
         .remove(&key);
     forget_dispatch_wait_record(root, verb, task);
     refresh_dispatch_wait_ledger(root);
+    write_project_heartbeat(root);
 }
 
 pub(super) const DISPATCH_WAIT_LEDGER_STALE_MS: u64 = 60_000;
@@ -2760,6 +2874,7 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
                 })
                 .unwrap_or(0);
             let lane = record.as_ref().and_then(|record| record.lane);
+            let band = agentplug_host::dispatch_lane_for_verb(&verb).as_str();
             let queue_state = agentplug_host::registry::lane_queue_state(root, lane, &task);
             let index_state = if CODE_INDEX_CONSUMING_VERBS.contains(&verb.as_str()) {
                 Some(index_state.get_or_insert_with(|| code_index_state(&spool_dir)).clone())
@@ -2770,6 +2885,7 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
                 "verb": verb,
                 "task": task,
                 "state": state,
+                "band": band,
                 "lane": lane,
                 "lane_position": queue_state.lane_position,
                 "lane_holder_age_ms": queue_state.lane_holder_age_ms,
@@ -2877,6 +2993,13 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
         "root": root.to_string_lossy(),
         "project_in_flight": project_in_flight_count(root),
         "project_in_flight_cap": MAX_CLAIMED_DISPATCHES_PER_PROJECT,
+        "project_in_flight_by_lane": {
+            "exec": project_in_flight_by_lane(root)[0],
+            "read": project_in_flight_by_lane(root)[1],
+            "state": project_in_flight_by_lane(root)[2],
+        },
+        "claim_cap_per_lane": MAX_CLAIMED_DISPATCHES_PER_PROJECT,
+        "claim_cap_per_session_lane": session_claim_cap_per_lane(),
         "lane_hold_report_min_ms": LANE_HOLD_REPORT_MIN_MS,
         "lane_hold_stuck_min_ms": lane_hold_stuck_min_ms(),
         "lane_hold_running_max_ms": lane_hold_running_max_ms(),
@@ -3169,7 +3292,7 @@ pub(super) fn project_has_queued_spool_work_cached(root: &Path) -> bool {
 }
 
 pub(super) fn project_has_pending_dispatch_work(root: &Path) -> bool {
-    project_in_flight_count(root) < MAX_CLAIMED_DISPATCHES_PER_PROJECT
+    lane_claim_budgets(root).iter().any(|budget| *budget > 0)
         && project_has_queued_spool_work_cached(root)
 }
 
@@ -3192,6 +3315,8 @@ pub(super) fn dispatch_project(
         task: String,
         body: String,
         submitted_at_ms: Option<u64>,
+        lane: agentplug_host::DispatchLane,
+        session: String,
     }
     let mut claimed: Vec<ClaimedRequest> = Vec::new();
     let queued_now = project_has_queued_spool_work_cached(root);
@@ -3200,7 +3325,7 @@ pub(super) fn dispatch_project(
         Some(scan) => scan.is_ok(),
         None => root_in_dir_exists_cached(root),
     };
-    let mut claimable: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
+    let mut claimable: Vec<ClaimCandidate> = Vec::new();
     if let Some(Ok(entries)) = in_dir_scan {
         for verb_entry in entries.flatten() {
             if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -3222,14 +3347,39 @@ pub(super) fn dispatch_project(
                     .metadata()
                     .and_then(|m| m.modified())
                     .unwrap_or(std::time::UNIX_EPOCH);
-                claimable.push((queued_since, verb.clone(), file_path));
+                let stem = file_path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                claimable.push(ClaimCandidate {
+                    queued_since,
+                    lane: agentplug_host::dispatch_lane_for_verb(&verb),
+                    session: session_key_from_task(&stem),
+                    verb: verb.clone(),
+                    path: file_path,
+                });
             }
         }
     }
-    claimable.sort_by_key(|(queued_since, _, _)| *queued_since);
-    let claim_budget =
-        MAX_CLAIMED_DISPATCHES_PER_PROJECT.saturating_sub(project_in_flight_count(root));
-    for (queued_since, verb, file_path) in claimable.into_iter().take(claim_budget) {
+    note_claim_pass(root);
+    let mut budgets = lane_claim_budgets(root);
+    let mut session_claims = session_lane_in_flight(root);
+    for candidate in order_claims_round_robin_by_session(claimable) {
+        let lane_index = candidate.lane.index();
+        if budgets[lane_index] == 0 {
+            continue;
+        }
+        let session_key = (lane_index, candidate.session.clone());
+        if session_claims.get(&session_key).copied().unwrap_or(0) >= session_claim_cap_per_lane() {
+            continue;
+        }
+        let ClaimCandidate {
+            queued_since,
+            verb,
+            path: file_path,
+            lane,
+            session,
+        } = candidate;
         let Some(claim_path) = spool_claim_path(&file_path) else {
             continue;
         };
@@ -3245,6 +3395,8 @@ pub(super) fn dispatch_project(
             let _ = fs::rename(&claim_path, &file_path);
             continue;
         }
+        budgets[lane_index] -= 1;
+        *session_claims.entry(session_key).or_insert(0) += 1;
         in_flight_map()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3252,6 +3404,8 @@ pub(super) fn dispatch_project(
                 (root.to_path_buf(), verb.clone(), task.clone()),
                 InFlightHandle {
                     detach: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    lane,
+                    session: session.clone(),
                 },
             );
         let submitted_at_ms = queued_since
@@ -3265,6 +3419,8 @@ pub(super) fn dispatch_project(
             task,
             body,
             submitted_at_ms,
+            lane,
+            session,
         });
     }
 
@@ -3281,7 +3437,7 @@ pub(super) fn dispatch_project(
     if fs::create_dir_all(&in_dir).is_err() || fs::create_dir_all(&out_dir).is_err() {
         return did_work;
     }
-    write_project_heartbeat_rate_limited(root, read_status_busy_until_if_future(root), None);
+    write_project_heartbeat_rate_limited(root, None);
 
     let requested_plugins = {
         let mut list = vec!["gm".to_string()];
@@ -3413,6 +3569,8 @@ pub(super) fn dispatch_project(
                         key.clone(),
                         InFlightHandle {
                             detach: detach_flag,
+                            lane: req.lane,
+                            session: req.session.clone(),
                         },
                     );
 
@@ -3455,7 +3613,7 @@ pub(super) fn dispatch_project(
             }
 
             answer_bg_converts(bg_convert_requests);
-            write_project_heartbeat(root, Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS));
+            write_project_heartbeat(root);
         }
     }
 

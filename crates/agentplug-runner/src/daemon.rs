@@ -360,6 +360,12 @@ struct DaemonConfig {
     project_idle_evict_secs: Option<u64>,
     #[serde(default)]
     shared_plugin_release_idle_secs: Option<u64>,
+    #[serde(default)]
+    exec_lane_slots: Option<usize>,
+    #[serde(default)]
+    read_lane_slots: Option<usize>,
+    #[serde(default)]
+    state_lane_slots: Option<usize>,
 }
 
 const DAEMON_CONFIG_EXAMPLE: &str = r#"{
@@ -368,7 +374,11 @@ const DAEMON_CONFIG_EXAMPLE: &str = r#"{
   "plugin_update_poll_interval_secs": 600,
   "plugin_update_poll_interval_secs_by_name": {},
   "runner_update_poll_interval_secs": 60,
-  "instruction_source_poll_interval_secs": 600
+  "instruction_source_poll_interval_secs": 600,
+  "gm_pool_size": 8,
+  "exec_lane_slots": 2,
+  "read_lane_slots": 2,
+  "state_lane_slots": 2
 }
 "#;
 
@@ -414,7 +424,21 @@ impl DaemonConfig {
             shared_store_recycle_dispatches: None,
             project_idle_evict_secs: None,
             shared_plugin_release_idle_secs: None,
+            exec_lane_slots: None,
+            read_lane_slots: None,
+            state_lane_slots: None,
         }
+    }
+    fn gm_lane_slots(&self) -> [usize; 3] {
+        let defaults = agentplug_host::default_lane_slots(self.gm_pool_size());
+        agentplug_host::registry::clamp_lane_slots(
+            [
+                self.exec_lane_slots.unwrap_or(defaults[0]),
+                self.read_lane_slots.unwrap_or(defaults[1]),
+                self.state_lane_slots.unwrap_or(defaults[2]),
+            ],
+            self.gm_pool_size(),
+        )
     }
     fn registry_poll_interval(&self) -> Duration {
         Duration::from_secs(self.registry_poll_interval_secs.unwrap_or(5))
@@ -1301,6 +1325,85 @@ pub fn release_standalone_watcher_slot(spool_dir: &Path) {
 
 pub fn shared_daemon_is_serving() -> bool {
     shared_daemon_owner_that_would_refuse_this_process().is_some()
+}
+
+const STANDALONE_IDLE_WAIT_MIN_MS: u64 = 25;
+const STANDALONE_IDLE_WAIT_MAX_MS: u64 = 250;
+
+fn clear_standalone_status(spool_dir: &Path) {
+    let status_path = spool_dir.join(".status.json");
+    let Some(serde_json::Value::Object(mut map)) = fs::read_to_string(&status_path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    else {
+        return;
+    };
+    for key in ["runtime", "daemon", "shared_process", "busy_until"] {
+        map.remove(key);
+    }
+    map.insert("ts".to_string(), serde_json::json!(now_ms()));
+    let _ = fs::write(&status_path, serde_json::Value::Object(map).to_string());
+}
+
+pub fn run_standalone_watcher(
+    mut project: ProjectPlugins,
+    spool_dir: &Path,
+    engine: Engine,
+    gm_module: Module,
+    gm_content_hash: String,
+) -> anyhow::Result<()> {
+    if !claim_standalone_watcher_slot(spool_dir) {
+        eprintln!(
+            "[agentplug] another standalone watcher is already live for {} -- exiting rather than sweeping the claims it is serving",
+            spool_dir.display()
+        );
+        return Ok(());
+    }
+    let root = project.root.clone();
+    RUNTIME_STANDALONE.store(true, std::sync::atomic::Ordering::Relaxed);
+    let daemon_cfg = DaemonConfig::load();
+    GM_PROCESSOR_CAPACITY.store(
+        daemon_cfg.gm_pool_size(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    *gm_processor_capacity_reason()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = daemon_cfg.gm_pool_capacity_reason();
+    let lane_slots = daemon_cfg.gm_lane_slots();
+    agentplug_host::set_gm_lane_slots(lane_slots[0], lane_slots[1], lane_slots[2]);
+    agentplug_host::set_sibling_reload_source((engine.clone(), {
+        let mut map = HashMap::new();
+        map.insert("gm".to_string(), (gm_module.clone(), gm_content_hash.clone()));
+        map
+    }));
+    let plugin_modules = PluginModules::standalone(engine, gm_module, gm_content_hash);
+    set_known_project_roots(std::slice::from_ref(&root));
+    let mut idle_wait_ms = STANDALONE_IDLE_WAIT_MIN_MS;
+    loop {
+        if shared_daemon_is_serving() {
+            clear_standalone_status(spool_dir);
+            release_standalone_watcher_slot(spool_dir);
+            eprintln!(
+                "[agentplug] shared daemon is serving again -- standalone watcher for {} exiting between claim passes, leaving every unclaimed request in the spool for it",
+                spool_dir.display()
+            );
+            return Ok(());
+        }
+        mark_spool_dirty(&root);
+        let did_work = dispatch_project(&root, &mut project, &plugin_modules);
+        if did_work {
+            write_project_heartbeat(&root);
+        } else {
+            write_project_heartbeat_rate_limited(&root, None);
+        }
+        refresh_dispatch_wait_ledger(&root);
+        idle_wait_ms = if did_work {
+            STANDALONE_IDLE_WAIT_MIN_MS
+        } else {
+            idle_wait_ms.saturating_mul(2).min(STANDALONE_IDLE_WAIT_MAX_MS)
+        };
+        std::thread::sleep(Duration::from_millis(idle_wait_ms));
+    }
 }
 
 pub fn arm_spool_launcher_deadline() -> Arc<std::sync::atomic::AtomicBool> {
@@ -2293,9 +2396,77 @@ fn cached_staged_runner() -> Option<(u64, u64)> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-fn write_project_heartbeat(root: &Path, busy_until: Option<u64>) {
-    write_project_heartbeat_with_queue_info(root, busy_until, None);
+fn write_project_heartbeat(root: &Path) {
+    write_project_heartbeat_with_queue_info(root, None);
 }
+
+const STATUS_BUSY_LEASE_MS: u64 = 15_000;
+
+static RUNTIME_STANDALONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn runtime_is_standalone() -> bool {
+    RUNTIME_STANDALONE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn unclaimed_mtime_snapshot() -> &'static Mutex<HashMap<PathBuf, Vec<u64>>> {
+    static SLOT: OnceLock<Mutex<HashMap<PathBuf, Vec<u64>>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct ProjectQueueFacts {
+    unclaimed: usize,
+    claimed: usize,
+    in_flight: usize,
+    in_flight_by_lane: [usize; 3],
+    oldest_unclaimed_ms: Option<u64>,
+}
+
+fn project_queue_facts(root: &Path) -> ProjectQueueFacts {
+    let in_flight_by_lane = project_in_flight_by_lane(root);
+    let in_flight: usize = in_flight_by_lane.iter().sum();
+    let (_, _, cached_queued, cached_claimed) = cached_root_scan(root);
+    if in_flight > 0 || cached_queued > 0 || cached_claimed > 0 {
+        mark_spool_dirty(root);
+    }
+    let (_, _, unclaimed, claimed) = cached_root_scan(root);
+    let oldest_unclaimed_ms = unclaimed_mtime_snapshot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(root)
+        .and_then(|mtimes| mtimes.iter().min().copied());
+    ProjectQueueFacts {
+        unclaimed,
+        claimed,
+        in_flight,
+        in_flight_by_lane,
+        oldest_unclaimed_ms,
+    }
+}
+
+fn queue_position_across_projects(root: &Path, oldest_unclaimed_ms: Option<u64>) -> usize {
+    let Some(oldest) = oldest_unclaimed_ms else {
+        return 0;
+    };
+    unclaimed_mtime_snapshot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(other, _)| other.as_path() != root)
+        .flat_map(|(_, mtimes)| mtimes.iter())
+        .filter(|mtime| **mtime < oldest)
+        .count()
+}
+
+fn lane_counts_json(counts: [usize; 3]) -> serde_json::Value {
+    serde_json::json!({
+        "exec": counts[0],
+        "read": counts[1],
+        "state": counts[2],
+    })
+}
+
+const TOOL_SERIALIZATION_SUMMARY: &str = "lanes: exec (exec-family verbs), read (read-only verbs), state (state-changing and indexing verbs); each lane has its own per-project claim budget (claim_cap_per_lane) and its own reserved gm pool slots (gm_lane_slots); sessions are claimed round-robin with mtime FIFO inside a session; git, store and state serial lanes still admit one writer per project";
 
 const DISPATCH_HEARTBEAT_MIN_GAP: Duration = Duration::from_secs(3);
 
@@ -2332,11 +2503,7 @@ fn dispatch_heartbeat_last_write() -> &'static Mutex<HashMap<PathBuf, Instant>> 
     SLOT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn write_project_heartbeat_rate_limited(
-    root: &Path,
-    busy_until: Option<u64>,
-    queue_info: Option<(usize, usize)>,
-) {
+fn write_project_heartbeat_rate_limited(root: &Path, queue_info: Option<(usize, usize)>) {
     let now = Instant::now();
     {
         let mut last_writes = dispatch_heartbeat_last_write()
@@ -2349,7 +2516,7 @@ fn write_project_heartbeat_rate_limited(
         }
         last_writes.insert(root.to_path_buf(), now);
     }
-    write_project_heartbeat_with_queue_info(root, busy_until, queue_info);
+    write_project_heartbeat_with_queue_info(root, queue_info);
 }
 
 fn plugin_compiling() -> &'static std::sync::atomic::AtomicBool {
@@ -2362,11 +2529,7 @@ fn project_status_write_lock() -> &'static Mutex<()> {
     SLOT.get_or_init(|| Mutex::new(()))
 }
 
-fn write_project_heartbeat_with_queue_info(
-    root: &Path,
-    busy_until: Option<u64>,
-    queue_info: Option<(usize, usize)>,
-) {
+fn write_project_heartbeat_with_queue_info(root: &Path, queue_info: Option<(usize, usize)>) {
     let _status_guard = project_status_write_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -2380,23 +2543,62 @@ fn write_project_heartbeat_with_queue_info(
         _ => serde_json::json!({}),
     };
     let previous = payload.clone();
+    let now = now_ms();
+    let standalone = runtime_is_standalone();
     payload["pid"] = serde_json::json!(std::process::id());
-    payload["ts"] = serde_json::json!(now_ms());
-    payload["daemon"] = serde_json::json!(true);
-    payload["shared_process"] = serde_json::json!(true);
-    payload["runtime"] = serde_json::json!("agentplug");
-    if let Some(busy_until) = busy_until {
-        payload["busy_until"] = serde_json::json!(busy_until);
+    payload["ts"] = serde_json::json!(now);
+    payload["daemon"] = serde_json::json!(!standalone);
+    payload["shared_process"] = serde_json::json!(!standalone);
+    payload["runtime"] = serde_json::json!(if standalone {
+        "agentplug-runner-standalone"
+    } else {
+        "agentplug"
+    });
+    let facts = project_queue_facts(root);
+    if facts.in_flight > 0 || facts.unclaimed > 0 {
+        payload["busy_until"] = serde_json::json!(now + STATUS_BUSY_LEASE_MS);
     } else {
         payload.as_object_mut().map(|m| m.remove("busy_until"));
     }
-    if let Some((position, total)) = queue_info {
-        payload["queue_position"] = serde_json::json!(position);
-        payload["queue_depth"] = serde_json::json!(total);
+    payload["queue_depth"] = serde_json::json!(facts.unclaimed);
+    payload["queue_position"] =
+        serde_json::json!(queue_position_across_projects(root, facts.oldest_unclaimed_ms));
+    payload["queued_step_count"] = serde_json::json!(facts.unclaimed);
+    payload["claimed_step_count"] = serde_json::json!(facts.claimed);
+    payload["in_flight_count"] = serde_json::json!(facts.in_flight);
+    payload["in_flight_by_lane"] = lane_counts_json(facts.in_flight_by_lane);
+    payload["oldest_unclaimed_age_ms"] = match facts.oldest_unclaimed_ms {
+        Some(oldest) => serde_json::json!(now.saturating_sub(oldest)),
+        None => serde_json::Value::Null,
+    };
+    match claim_pass_ts(root) {
+        Some(ts) => {
+            payload["claim_pass_ts"] = serde_json::json!(ts);
+            payload["claim_pass_age_ms"] = serde_json::json!(now.saturating_sub(ts));
+        }
+        None => {
+            if let Some(map) = payload.as_object_mut() {
+                map.remove("claim_pass_ts");
+                map.remove("claim_pass_age_ms");
+            }
+        }
     }
-    let (queued_steps, claimed_steps) = spool_step_counts(root);
-    payload["queued_step_count"] = serde_json::json!(queued_steps);
-    payload["claimed_step_count"] = serde_json::json!(claimed_steps);
+    if let Some((position, total)) = queue_info {
+        payload["project_queue_position"] = serde_json::json!(position);
+        payload["project_queue_depth"] = serde_json::json!(total);
+    }
+    payload["claim_cap_per_lane"] = serde_json::json!(MAX_CLAIMED_DISPATCHES_PER_PROJECT);
+    payload["claim_cap_per_session_lane"] = serde_json::json!(session_claim_cap_per_lane());
+    payload["gm_lane_slots"] = lane_counts_json(agentplug_host::gm_lane_slots());
+    let lane_snapshot = agentplug_host::shared_plugin_lane_snapshot("gm");
+    let mut lane_in_flight = [0usize; 3];
+    let mut lane_waiting = [0usize; 3];
+    for (index, lane) in lane_snapshot.iter().enumerate().take(3) {
+        lane_in_flight[index] = lane.in_flight;
+        lane_waiting[index] = lane.waiting;
+    }
+    payload["gm_lane_in_flight"] = lane_counts_json(lane_in_flight);
+    payload["gm_lane_waiting"] = lane_counts_json(lane_waiting);
     payload["gm_processor_capacity"] =
         serde_json::json!(GM_PROCESSOR_CAPACITY.load(std::sync::atomic::Ordering::Relaxed));
     payload["gm_processor_capacity_reason"] = serde_json::json!(gm_processor_capacity_reason()
@@ -2405,7 +2607,7 @@ fn write_project_heartbeat_with_queue_info(
         .clone());
     payload["shared_store_recycle_limit_mb"] =
         serde_json::json!(SHARED_STORE_RECYCLE_LIMIT_MB.load(std::sync::atomic::Ordering::Relaxed));
-    payload["tool_serialization"] = serde_json::json!("fifo per plugin and verb for state-changing verbs, one dispatch per project lane (git, read, store, state); exec-family, read-only verbs and tree-scan codesearch run unserialised");
+    payload["tool_serialization"] = serde_json::json!(TOOL_SERIALIZATION_SUMMARY);
     payload["runner_version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
     payload["loaded_plugin_versions"] = serde_json::json!(loaded_plugin_versions()
         .lock()
@@ -2474,17 +2676,36 @@ fn status_write_needed(
                 "sweep_holder_root",
                 "runner_update_waiting_ms",
                 "queue_wait_ms",
+                "claim_pass_age_ms",
+                "oldest_unclaimed_age_ms",
+                "busy_until",
             ] {
                 map.remove(key);
             }
         }
         copy
     }
+    const QUEUE_FACT_FIELDS: [&str; 7] = [
+        "queue_depth",
+        "queue_position",
+        "claimed_step_count",
+        "in_flight_count",
+        "in_flight_by_lane",
+        "claim_pass_ts",
+        "runtime",
+    ];
     let last_written_age = fs::metadata(status_path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok());
     if previous.get("pid") != next.get("pid") {
+        return true;
+    }
+    if QUEUE_FACT_FIELDS
+        .iter()
+        .any(|field| previous.get(field) != next.get(field))
+        || previous.get("busy_until").is_some() != next.get("busy_until").is_some()
+    {
         return true;
     }
     let Some(age) = last_written_age else {
@@ -2638,9 +2859,7 @@ pub(crate) fn idle_projects_to_evict(
     }
 }
 
-const TICKER_BUSY_UNTIL_EXTEND_MS: u64 = 60_000;
-
-const SPOOL_SCAN_BACKSTOP_TTL: Duration = Duration::from_secs(120);
+const SPOOL_SCAN_BACKSTOP_TTL: Duration = Duration::from_secs(2);
 
 fn spool_scan_scheduled_at(root: &Path) -> Instant {
     use std::hash::{Hash, Hasher};
@@ -2661,6 +2880,90 @@ struct RootScan {
     in_dir_exists: bool,
 }
 
+struct SpoolFacts {
+    has_queued_work: bool,
+    queued: usize,
+    claimed: usize,
+    unclaimed_mtimes: Vec<u64>,
+}
+
+fn verb_dir_settled_empty(verb_dir: &Path) -> Option<std::time::SystemTime> {
+    let modified = fs::metadata(verb_dir)
+        .and_then(|metadata| metadata.modified())
+        .ok()?;
+    let unchanged = empty_verb_dir_verdicts()
+        .lock()
+        .ok()
+        .is_some_and(|verdicts| verdicts.get(verb_dir) == Some(&modified));
+    unchanged.then_some(modified)
+}
+
+fn record_verb_dir_empty_verdict(verb_dir: &Path) {
+    let Ok(modified) = fs::metadata(verb_dir).and_then(|metadata| metadata.modified()) else {
+        return;
+    };
+    let settled = std::time::SystemTime::now()
+        .duration_since(modified)
+        .is_ok_and(|age| age >= EMPTY_VERB_DIR_VERDICT_MIN_AGE);
+    if settled {
+        if let Ok(mut verdicts) = empty_verb_dir_verdicts().lock() {
+            verdicts.insert(verb_dir.to_path_buf(), modified);
+        }
+    }
+}
+
+fn scan_spool_facts(root: &Path) -> SpoolFacts {
+    let mut facts = SpoolFacts {
+        has_queued_work: false,
+        queued: 0,
+        claimed: 0,
+        unclaimed_mtimes: Vec::new(),
+    };
+    let in_dir = spool_dir_of(root).join("in");
+    let Ok(verbs) = fs::read_dir(&in_dir) else {
+        return facts;
+    };
+    for verb_entry in verbs.flatten() {
+        if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let verb = verb_entry.file_name().to_string_lossy().into_owned();
+        let verb_dir = verb_entry.path();
+        if verb_dir_settled_empty(&verb_dir).is_some() {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(&verb_dir) else {
+            continue;
+        };
+        let mut saw_request = false;
+        for file_entry in files.flatten() {
+            let name = file_entry.file_name().to_string_lossy().into_owned();
+            let path = file_entry.path();
+            if is_spool_request_path(&verb, &path) {
+                facts.queued += 1;
+                facts.has_queued_work = true;
+                saw_request = true;
+                let mtime = file_entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or_else(now_ms);
+                facts.unclaimed_mtimes.push(mtime);
+            } else if name.ends_with(".inflight") {
+                facts.claimed += 1;
+                facts.has_queued_work = true;
+                saw_request = true;
+            }
+        }
+        if !saw_request {
+            record_verb_dir_empty_verdict(&verb_dir);
+        }
+    }
+    facts
+}
+
 fn spool_dirty_roots() -> &'static Mutex<HashSet<PathBuf>> {
     static SLOT: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(HashSet::new()))
@@ -2675,36 +2978,6 @@ fn mark_spool_dirty(root: &Path) {
 fn root_scan_cache() -> &'static Mutex<HashMap<PathBuf, RootScan>> {
     static SLOT: OnceLock<Mutex<HashMap<PathBuf, RootScan>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn count_spool_steps(root: &Path) -> (bool, usize, usize) {
-    let mut queued = 0usize;
-    let mut claimed = 0usize;
-    let mut has_queued_work = false;
-    let in_dir = spool_dir_of(root).join("in");
-    let Ok(verbs) = fs::read_dir(&in_dir) else {
-        return (has_queued_work, queued, claimed);
-    };
-    for verb_entry in verbs.flatten() {
-        if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let verb = verb_entry.file_name().to_string_lossy().into_owned();
-        let Ok(files) = fs::read_dir(verb_entry.path()) else {
-            continue;
-        };
-        for file_entry in files.flatten() {
-            let name = file_entry.file_name().to_string_lossy().into_owned();
-            if is_spool_request_path(&verb, &file_entry.path()) {
-                queued += 1;
-                has_queued_work = true;
-            } else if name.ends_with(".inflight") {
-                claimed += 1;
-                has_queued_work = true;
-            }
-        }
-    }
-    (has_queued_work, queued, claimed)
 }
 
 fn cached_root_scan(root: &Path) -> (bool, bool, usize, usize) {
@@ -2732,13 +3005,17 @@ fn cached_root_scan(root: &Path) -> (bool, bool, usize, usize) {
         }
     }
     let queued_work = project_has_queued_spool_work(root);
-    let counted = count_spool_steps(root);
+    let facts = scan_spool_facts(root);
+    unclaimed_mtime_snapshot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(root.to_path_buf(), facts.unclaimed_mtimes);
     let scan = RootScan {
         at: spool_scan_scheduled_at(root),
         claimable: queued_work,
-        has_queued_work: counted.0,
-        queued_steps: counted.1,
-        claimed_steps: counted.2,
+        has_queued_work: facts.has_queued_work,
+        queued_steps: facts.queued,
+        claimed_steps: facts.claimed,
         in_dir_exists: spool_dir_of(root).join("in").is_dir(),
     };
     let result = (
@@ -3125,11 +3402,7 @@ fn refresh_project_heartbeats_off_loop() {
         if fs::create_dir_all(&spool_dir_of(&root)).is_err() {
             continue;
         }
-        write_project_heartbeat_with_queue_info(
-            &root,
-            read_status_busy_until_if_future(&root),
-            None,
-        );
+        write_project_heartbeat_with_queue_info(&root, None);
     }
 }
 
@@ -3167,6 +3440,31 @@ impl PluginModules {
             last_hash_check_stat: HashMap::new(),
             recompiling: HashMap::new(),
         })
+    }
+
+    fn standalone(engine: Engine, gm_module: Module, gm_content_hash: String) -> Self {
+        let mut modules = HashMap::new();
+        modules.insert("gm".to_string(), gm_module);
+        let mut loaded_content_hash = HashMap::new();
+        loaded_content_hash.insert("gm".to_string(), gm_content_hash.clone());
+        loaded_plugin_content_hashes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("gm".to_string(), gm_content_hash);
+        loaded_plugin_versions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                "gm".to_string(),
+                installed_plugin_version("gm").unwrap_or_else(|| "unversioned".to_string()),
+            );
+        Self {
+            engine,
+            modules,
+            loaded_content_hash,
+            last_hash_check_stat: HashMap::new(),
+            recompiling: HashMap::new(),
+        }
     }
 
     fn install_compiled(
@@ -3594,6 +3892,16 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     );
     agentplug_host::set_gm_pool_size(daemon_cfg.gm_pool_size());
     agentplug_host::set_side_plugin_pool_size(daemon_cfg.side_plugin_concurrency());
+    let lane_slots = daemon_cfg.gm_lane_slots();
+    agentplug_host::set_gm_lane_slots(lane_slots[0], lane_slots[1], lane_slots[2]);
+    eprintln!(
+        "[agentplug daemon] gm lane slots: exec={} read={} state={} of {} (exec_lane_slots/read_lane_slots/state_lane_slots in daemon-config.json override; claim budget per lane per project {})",
+        lane_slots[0],
+        lane_slots[1],
+        lane_slots[2],
+        daemon_cfg.gm_pool_size(),
+        MAX_CLAIMED_DISPATCHES_PER_PROJECT
+    );
 
     crate::download::gc_stale_tmp_files(Duration::from_secs(60 * 60));
 
@@ -3725,7 +4033,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 .collect();
             for root in &roots_new_this_registry_poll {
                 mark_spool_dirty(root);
-                write_project_heartbeat(root, None);
+                write_project_heartbeat(root);
                 eprintln!(
                     "[agentplug daemon] lease attached: serving {} ({} leased project(s))",
                     root.display(),
@@ -3887,11 +4195,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         for (position, (_, root)) in active_roots.iter().enumerate() {
             let spool_dir = root.join(".gm").join("exec-spool");
             if fs::create_dir_all(&spool_dir).is_ok() {
-                write_project_heartbeat_rate_limited(
-                    root,
-                    read_status_busy_until_if_future(root),
-                    Some((position, reported_queue_total)),
-                );
+                write_project_heartbeat_rate_limited(root, Some((position, reported_queue_total)));
             }
         }
         let mut background_projects = Vec::with_capacity(all_projects.len());
@@ -3945,12 +4249,8 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         for (root, project, did_work) in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
             any_work = any_work || did_work;
             let spool_dir = root.join(".gm").join("exec-spool");
-            if fs::create_dir_all(&spool_dir).is_ok() {
-                write_project_heartbeat_rate_limited(
-                    root.as_path(),
-                    read_status_busy_until_if_future(root.as_path()),
-                    Some((0, 0)),
-                );
+            if did_work && fs::create_dir_all(&spool_dir).is_ok() {
+                write_project_heartbeat_rate_limited(root.as_path(), None);
             }
             projects.insert(root, project);
         }

@@ -233,6 +233,181 @@ fn side_plugin_pool_size() -> usize {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchLane {
+    Exec,
+    Read,
+    State,
+}
+
+impl DispatchLane {
+    pub const ALL: [DispatchLane; 3] = [DispatchLane::Exec, DispatchLane::Read, DispatchLane::State];
+
+    pub fn index(self) -> usize {
+        match self {
+            DispatchLane::Exec => 0,
+            DispatchLane::Read => 1,
+            DispatchLane::State => 2,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DispatchLane::Exec => "exec",
+            DispatchLane::Read => "read",
+            DispatchLane::State => "state",
+        }
+    }
+}
+
+const READ_ONLY_DISPATCH_VERBS: &[&str] = &[
+    "git_status",
+    "branch_status",
+    "git_log",
+    "git_diff",
+    "git_show",
+    "git_poll",
+    "ci-status",
+    "status",
+    "wait",
+    "sleep",
+    "close",
+    "filter",
+    "callers",
+    "callees",
+    "impact",
+    "codeinsight",
+    "health",
+    "recall",
+    "fs_read",
+    "fs_readdir",
+    "fs_stat",
+    "env_get",
+    "kv_get",
+    "config_resolve",
+    "phase-status",
+    "prd-list",
+    "prd-status",
+    "mutable-list",
+    "grep",
+];
+
+pub fn dispatch_lane_for_verb(verb: &str) -> DispatchLane {
+    if BLOCKING_DISPATCH_VERBS.contains(&verb) {
+        DispatchLane::Exec
+    } else if SHORT_DISPATCH_VERBS.contains(&verb) || READ_ONLY_DISPATCH_VERBS.contains(&verb) {
+        DispatchLane::Read
+    } else {
+        DispatchLane::State
+    }
+}
+
+pub fn dispatch_lane_for_dispatch(verb: &str, body: &str) -> DispatchLane {
+    if verb == "codesearch" {
+        return if tree_scan_without_indexing(verb, body) {
+            DispatchLane::Read
+        } else {
+            DispatchLane::State
+        };
+    }
+    dispatch_lane_for_verb(verb)
+}
+
+const LANE_RESERVATION_MIN_POOL_SIZE: usize = 3;
+
+pub fn default_lane_slots(pool_size: usize) -> [usize; 3] {
+    let share = (pool_size / 4).max(1);
+    clamp_lane_slots([share, share, share], pool_size)
+}
+
+pub fn clamp_lane_slots(requested: [usize; 3], pool_size: usize) -> [usize; 3] {
+    if pool_size < LANE_RESERVATION_MIN_POOL_SIZE {
+        return [0, 0, 0];
+    }
+    let mut slots = requested;
+    loop {
+        let total: usize = slots.iter().sum();
+        let every_lane_reserved = slots.iter().all(|reserved| *reserved > 0);
+        let cap = if every_lane_reserved { pool_size } else { pool_size - 1 };
+        if total <= cap {
+            return slots;
+        }
+        let Some(largest) = (0..3).rev().max_by_key(|index| slots[*index]) else {
+            return slots;
+        };
+        if slots[largest] == 0 {
+            return slots;
+        }
+        slots[largest] -= 1;
+    }
+}
+
+static GM_LANE_SLOTS: OnceLock<[usize; 3]> = OnceLock::new();
+
+pub fn set_gm_lane_slots(exec: usize, read: usize, state: usize) -> bool {
+    GM_LANE_SLOTS
+        .set(clamp_lane_slots([exec, read, state], gm_pool_size()))
+        .is_ok()
+}
+
+pub fn gm_lane_slots() -> [usize; 3] {
+    *GM_LANE_SLOTS.get_or_init(|| default_lane_slots(gm_pool_size()))
+}
+
+const SESSION_KEY_PARSE_MAX_BYTES: usize = 256 * 1024;
+
+const SESSION_KEY_NUMERIC_SUFFIXES: usize = 3;
+
+pub fn session_key_from_task(task: &str) -> String {
+    let mut key = task;
+    for _ in 0..SESSION_KEY_NUMERIC_SUFFIXES {
+        let Some((head, tail)) = key.rsplit_once('-') else {
+            break;
+        };
+        if tail.is_empty() || !tail.bytes().all(|byte| byte.is_ascii_digit()) {
+            break;
+        }
+        key = head;
+    }
+    key.to_string()
+}
+
+fn session_key_for_dispatch(body: &str) -> String {
+    let from_body = session_key_from_body(body);
+    if !from_body.is_empty() {
+        return from_body;
+    }
+    crate::dispatch_origin::current_dispatch_task()
+        .map(|task| session_key_from_task(&task))
+        .unwrap_or_default()
+}
+
+pub fn session_key_from_body(body: &str) -> String {
+    let trimmed = body.trim_start();
+    if trimmed.starts_with('{') {
+        if trimmed.len() > SESSION_KEY_PARSE_MAX_BYTES {
+            return String::new();
+        }
+        return serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .and_then(|value| {
+                ["session_id", "sessionId", "SESSION_ID"]
+                    .into_iter()
+                    .filter_map(|name| value.get(name).and_then(|entry| entry.as_str()))
+                    .map(str::trim)
+                    .find(|session| !session.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+    }
+    trimmed
+        .lines()
+        .take(3)
+        .find_map(|line| line.trim().strip_prefix("gm_session_id="))
+        .map(|session| session.trim().to_string())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchCostClass {
     Cheap,
     Heavy,
@@ -363,6 +538,50 @@ pub struct SharedPluginPool {
         Mutex<std::collections::HashMap<String, usize>>,
     ticket_queue: Mutex<TicketQueue>,
     slot_released: Condvar,
+    lane_reservations: [usize; 3],
+}
+
+pub struct SlotLease<'a> {
+    guard: Option<std::sync::MutexGuard<'a, Option<SiblingHandle>>>,
+    pool: &'a SharedPluginPool,
+    lane: usize,
+    project: String,
+    session: String,
+}
+
+impl<'a> SlotLease<'a> {
+    pub fn inner(&mut self) -> &mut std::sync::MutexGuard<'a, Option<SiblingHandle>> {
+        self.guard
+            .as_mut()
+            .expect("a slot lease holds its guard until it is dropped")
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.guard.as_ref().map(|guard| guard.is_none()).unwrap_or(true)
+    }
+}
+
+impl Drop for SlotLease<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        {
+            let mut q = self
+                .pool
+                .ticket_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            q.release_lane_slot(self.lane, &self.project, &self.session);
+        }
+        self.pool.slot_released.notify_all();
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LaneSlotSnapshot {
+    pub lane: &'static str,
+    pub reserved: usize,
+    pub in_flight: usize,
+    pub waiting: usize,
 }
 
 struct ClassTicketQueue {
@@ -393,6 +612,14 @@ enum HolderKind {
     Blocking,
 }
 
+struct LaneSlotWaiter {
+    id: u64,
+    lane: usize,
+    project: String,
+    session: String,
+    arrival: u64,
+}
+
 struct TicketQueue {
     cheap: ClassTicketQueue,
     heavy: ClassTicketQueue,
@@ -403,9 +630,87 @@ struct TicketQueue {
     git_band_inflight: usize,
     holders: Vec<AdmissionHolder>,
     next_holder_id: u64,
+    lane_inflight: [usize; 3],
+    lane_project_use: HashMap<(usize, String), usize>,
+    lane_session_use: HashMap<(usize, String), usize>,
+    lane_waiters: Vec<LaneSlotWaiter>,
+    next_lane_waiter_id: u64,
 }
 
 impl TicketQueue {
+    fn lane_use_of(&self, lane: usize, project: &str, session: &str) -> (usize, usize) {
+        (
+            self.lane_project_use
+                .get(&(lane, project.to_string()))
+                .copied()
+                .unwrap_or(0),
+            self.lane_session_use
+                .get(&(lane, session.to_string()))
+                .copied()
+                .unwrap_or(0),
+        )
+    }
+
+    fn lane_head(&self, lane: usize) -> Option<u64> {
+        self.lane_waiters
+            .iter()
+            .filter(|waiter| waiter.lane == lane)
+            .min_by_key(|waiter| {
+                let (project_use, session_use) =
+                    self.lane_use_of(lane, &waiter.project, &waiter.session);
+                (project_use, session_use, waiter.arrival, waiter.id)
+            })
+            .map(|waiter| waiter.id)
+    }
+
+    fn lane_capacity_allows(&self, reservations: &[usize; 3], lane: usize, free_now: usize) -> bool {
+        if free_now == 0 {
+            return false;
+        }
+        if self.lane_inflight[lane] < reservations[lane] {
+            return true;
+        }
+        let unused_elsewhere: usize = (0..3)
+            .filter(|other| *other != lane)
+            .map(|other| reservations[other].saturating_sub(self.lane_inflight[other]))
+            .sum();
+        free_now - 1 >= unused_elsewhere
+    }
+
+    fn take_lane_slot(&mut self, lane: usize, project: &str, session: &str) {
+        self.lane_inflight[lane] += 1;
+        *self
+            .lane_project_use
+            .entry((lane, project.to_string()))
+            .or_insert(0) += 1;
+        *self
+            .lane_session_use
+            .entry((lane, session.to_string()))
+            .or_insert(0) += 1;
+    }
+
+    fn release_lane_slot(&mut self, lane: usize, project: &str, session: &str) {
+        self.lane_inflight[lane] = self.lane_inflight[lane].saturating_sub(1);
+        for (map, key) in [
+            (&mut self.lane_project_use, (lane, project.to_string())),
+            (&mut self.lane_session_use, (lane, session.to_string())),
+        ] {
+            if let Some(count) = map.get_mut(&key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    map.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn lane_waiting(&self, lane: usize) -> usize {
+        self.lane_waiters
+            .iter()
+            .filter(|waiter| waiter.lane == lane)
+            .count()
+    }
+
     fn register_holder(&mut self, verb: &str, kind: HolderKind) -> u64 {
         self.next_holder_id += 1;
         let id = self.next_holder_id;
@@ -768,6 +1073,11 @@ fn clear_admission_wait() {
 impl SharedPluginPool {
     pub fn new(plugin_name: &str, size: usize) -> Self {
         let size = size.max(1);
+        let lane_reservations = if plugin_name == "gm" {
+            clamp_lane_slots(gm_lane_slots(), size)
+        } else {
+            [0, 0, 0]
+        };
         Self {
             plugin_name: plugin_name.to_string(),
             slots: (0..size).map(|_| Arc::new(Mutex::new(None))).collect(),
@@ -794,8 +1104,104 @@ impl SharedPluginPool {
                 git_band_inflight: 0,
                 holders: Vec::new(),
                 next_holder_id: 0,
+                lane_inflight: [0; 3],
+                lane_project_use: HashMap::new(),
+                lane_session_use: HashMap::new(),
+                lane_waiters: Vec::new(),
+                next_lane_waiter_id: 0,
             }),
             slot_released: Condvar::new(),
+            lane_reservations,
+        }
+    }
+
+    pub fn lane_reservations(&self) -> [usize; 3] {
+        self.lane_reservations
+    }
+
+    pub fn lane_snapshot(&self) -> Vec<LaneSlotSnapshot> {
+        let q = self.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+        DispatchLane::ALL
+            .iter()
+            .map(|lane| LaneSlotSnapshot {
+                lane: lane.as_str(),
+                reserved: self.lane_reservations[lane.index()],
+                in_flight: q.lane_inflight[lane.index()],
+                waiting: q.lane_waiting(lane.index()),
+            })
+            .collect()
+    }
+
+    pub fn acquire_slot_for_lane(
+        &self,
+        timeout_ms: u64,
+        lane: DispatchLane,
+        project: &str,
+        session: &str,
+    ) -> (SlotLease<'_>, u64) {
+        let start = std::time::Instant::now();
+        let lane_index = lane.index();
+        let my_id = {
+            let mut q = self.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.next_lane_waiter_id += 1;
+            let id = q.next_lane_waiter_id;
+            q.lane_waiters.push(LaneSlotWaiter {
+                id,
+                lane: lane_index,
+                project: project.to_string(),
+                session: session.to_string(),
+                arrival: crate::now_ms(),
+            });
+            id
+        };
+        loop {
+            {
+                let mut q = self.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+                if q.lane_head(lane_index) == Some(my_id) {
+                    let mut free: Vec<std::sync::MutexGuard<'_, Option<SiblingHandle>>> = self
+                        .slots
+                        .iter()
+                        .filter_map(|slot| try_lock_slot_recovering_from_poison(slot))
+                        .collect();
+                    if q.lane_capacity_allows(&self.lane_reservations, lane_index, free.len()) {
+                        let guard = free.swap_remove(0);
+                        drop(free);
+                        q.take_lane_slot(lane_index, project, session);
+                        q.lane_waiters.retain(|waiter| waiter.id != my_id);
+                        drop(q);
+                        self.slot_released.notify_all();
+                        return (
+                            SlotLease {
+                                guard: Some(guard),
+                                pool: self,
+                                lane: lane_index,
+                                project: project.to_string(),
+                                session: session.to_string(),
+                            },
+                            start.elapsed().as_millis() as u64,
+                        );
+                    }
+                }
+            }
+            let guard = self.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = self
+                .slot_released
+                .wait_timeout(guard, std::time::Duration::from_millis(25))
+                .unwrap_or_else(|e| e.into_inner());
+            let waited = start.elapsed().as_millis() as u64;
+            if waited > timeout_ms && waited % 5_000 < 30 {
+                let snapshot = self.lane_snapshot();
+                eprintln!(
+                    "[agentplug registry] lane slot wait exceeded diagnostic threshold ({waited}ms > {timeout_ms}ms) -- still waiting, plugin={} lane={} project={project} session={session} slots={} lanes={:?}, not denying",
+                    self.plugin_name,
+                    lane.as_str(),
+                    self.slots.len(),
+                    snapshot
+                        .iter()
+                        .map(|s| format!("{}:{}/{} waiting {}", s.lane, s.in_flight, s.reserved, s.waiting))
+                        .collect::<Vec<_>>()
+                );
+            }
         }
     }
 
@@ -1377,6 +1783,16 @@ pub fn shared_plugin_slot_content_hashes(plugin_name: &str) -> Vec<Option<String
         .unwrap_or_default()
 }
 
+pub fn shared_plugin_lane_snapshot(plugin_name: &str) -> Vec<LaneSlotSnapshot> {
+    SHARED_PLUGINS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(plugin_name)
+        .map(|pool| pool.lane_snapshot())
+        .unwrap_or_default()
+}
+
 pub fn shared_plugin_slot_snapshot_without_blocking(plugin_name: &str) -> Vec<SlotContentSnapshot> {
     SHARED_PLUGINS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -1741,6 +2157,9 @@ impl ProjectPlugins {
             plugin_name: plugin_name.to_string(),
         })?;
         let cost_class = cost_class_for_dispatch(verb, body);
+        let lane = dispatch_lane_for_dispatch(verb, body);
+        let project_key = lane_root_identity(&self.root);
+        let session_key = session_key_for_dispatch(body);
         // A dispatch holds an admission slot only while it is about to run: it takes a
         // plugin slot first and then asks for admission, and when admission is not granted
         // at once it hands the plugin slot back and re-queues. A dispatch that waits for a
@@ -1753,11 +2172,15 @@ impl ProjectPlugins {
         let admission_deadline =
             Instant::now() + admission_wait_max_for(cost_class).max(admission_wait_max());
         let (mut guard, _waited_ms) = loop {
-            let (mut slot, waited) =
-                pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
+            let (mut slot, waited) = pool.acquire_slot_for_lane(
+                SharedPluginPool::ACQUIRE_TIMEOUT_MS,
+                lane,
+                &project_key,
+                &session_key,
+            );
             if slot.is_none() {
                 if let Err(detail) =
-                    refill_evicted_slot(&mut slot, None, &self.root, plugin_name, verb)
+                    refill_evicted_slot(slot.inner(), None, &self.root, plugin_name, verb)
                 {
                     eprintln!("[agentplug registry] plugin {plugin_name} slot was evicted for verb {verb} and its refill did not repopulate it -- {detail}");
                     log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("empty-slot refill failed: {detail}"));
@@ -1804,7 +2227,7 @@ impl ProjectPlugins {
             }
         };
         dispatch_and_evict_on_error(
-            &mut guard,
+            guard.inner(),
             &pool,
             verb,
             body,
@@ -1920,6 +2343,9 @@ impl DispatchHandle {
             plugin_name: plugin_name.to_string(),
         })?;
         let cost_class = cost_class_for_dispatch(verb, body);
+        let lane = dispatch_lane_for_dispatch(verb, body);
+        let project_key = lane_root_identity(&self.root);
+        let session_key = session_key_for_dispatch(body);
         // A dispatch holds an admission slot only while it is about to run: it takes a
         // plugin slot first and then asks for admission, and when admission is not granted
         // at once it hands the plugin slot back and re-queues. A dispatch that waits for a
@@ -1932,11 +2358,15 @@ impl DispatchHandle {
         let admission_deadline =
             Instant::now() + admission_wait_max_for(cost_class).max(admission_wait_max());
         let (mut guard, _waited_ms) = loop {
-            let (mut slot, waited) =
-                pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
+            let (mut slot, waited) = pool.acquire_slot_for_lane(
+                SharedPluginPool::ACQUIRE_TIMEOUT_MS,
+                lane,
+                &project_key,
+                &session_key,
+            );
             if slot.is_none() {
                 if let Err(detail) = refill_evicted_slot(
-                    &mut slot,
+                    slot.inner(),
                     self.reload_source.as_ref(),
                     &self.root,
                     plugin_name,
@@ -1987,7 +2417,7 @@ impl DispatchHandle {
             }
         };
         dispatch_and_evict_on_error(
-            &mut guard,
+            guard.inner(),
             &pool,
             verb,
             body,

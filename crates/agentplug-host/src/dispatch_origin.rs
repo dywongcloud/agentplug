@@ -37,6 +37,10 @@ pub fn enter_dispatch_origin_scope(
     DispatchOriginScope { previous }
 }
 
+pub(crate) fn current_dispatch_task() -> Option<String> {
+    CURRENT_DISPATCH_ORIGIN.with(|cell| cell.borrow().as_ref().and_then(|origin| origin.spool_task.clone()))
+}
+
 pub(crate) fn dispatch_env_value(key: &str) -> Option<Option<String>> {
     if !key.starts_with(DISPATCH_ENV_PREFIX) {
         return None;

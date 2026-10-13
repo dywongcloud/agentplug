@@ -81,6 +81,22 @@ and the `agentplug-host` imports. Work on `main` as GitHub user `lanmower`.
 - Dispatch concurrency is intentionally lane-based: read-only work remains parallel while state,
   store, and Git mutations serialize only against their own lane. A claimed request must always
   produce an out-file or be released for recovery.
+- Capacity is split by dispatch lane (`DispatchLane`: `exec`, `read`, `state`; membership in
+  `dispatch_lane_for_verb`). The claim pass keeps one budget of `MAX_CLAIMED_DISPATCHES_PER_PROJECT`
+  per lane per project, lets one session hold at most half of it (`session_claim_cap_per_lane`), and
+  claims round-robin across session keys (the in-file stem before its numeric suffixes), so an exec
+  or read ticket is claimed while the state lane is saturated and a second session is claimed while
+  the first floods. A dispatch whose body names no session (exec bodies) takes its session key from
+  the spool task recorded in `dispatch_origin`, so pool fairness sees it. The `gm`
+  pool reserves `exec_lane_slots`/`read_lane_slots`/`state_lane_slots` (daemon-config.json, default
+  `max(1, pool/4)` each) and serves a lane's waiters least-loaded project first, then session, then
+  arrival. The standalone `spool` fallback (`run_standalone_watcher`) runs the same claim pass and
+  status writer as the daemon; never reintroduce a serial dispatch loop there.
+- `.status.json` counts the spool at write time: `queue_depth` is the unclaimed in-files of the
+  project, `queue_position` the older unclaimed in-files across served projects, `in_flight_count`
+  the claimed dispatches, `claim_pass_age_ms` the age of the last claim pass, and `busy_until` exists
+  only while work is queued or in flight. The round-robin place is `project_queue_position`. The
+  file is rewritten whenever one of these counts changes.
 - Kill only processes owned by this host.
 - Every subprocess has a bounded wall-clock deadline and tree cleanup. Keep stdout/stderr draining
   concurrent with child execution, and keep oversized dispatch results in a spill file rather than
